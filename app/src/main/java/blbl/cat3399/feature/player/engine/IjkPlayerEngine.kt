@@ -9,6 +9,7 @@ import blbl.cat3399.BuildConfig
 import blbl.cat3399.core.api.video.VideoMediaRequestProfile
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.core.net.BiliClient
+import blbl.cat3399.feature.player.DebugStreamKind
 import blbl.cat3399.feature.player.Playable
 import tv.danmaku.ijk.media.player.IMediaPlayer
 import tv.danmaku.ijk.media.player.IjkMediaPlayer
@@ -20,9 +21,12 @@ import java.util.concurrent.CopyOnWriteArraySet
 
 internal class IjkPlayerEngine(
     context: Context,
+    private val onTransferHost: ((kind: DebugStreamKind, host: String) -> Unit)? = null,
+    private val onBytesTransferred: ((kind: DebugStreamKind, bytesTransferred: Long) -> Unit)? = null,
 ) : BlblPlayerEngine {
     private val appContext: Context = context.applicationContext
     private val listeners: MutableSet<BlblPlayerEngine.Listener> = CopyOnWriteArraySet()
+    private val dashProxies = LinkedHashMap<VideoMediaRequestProfile, DashLocalHttpProxy>()
 
     private var ijk: IjkMediaPlayer? = null
     private var prepared: Boolean = false
@@ -226,17 +230,35 @@ internal class IjkPlayerEngine(
                 is PlaybackSource.Vod -> {
                     when (val playable = dataSource.playable) {
                         is Playable.Dash -> {
+                            val videoProxy = dashProxyFor(playable.videoMediaRequestProfile)
+                            val audioProxy = dashProxyFor(playable.audioMediaRequestProfile)
+                            videoProxy.resetRegistrations()
+                            if (audioProxy !== videoProxy) audioProxy.resetRegistrations()
+                            val videoBaseUrl =
+                                videoProxy.register(
+                                    kind = "v",
+                                    upstreamUrl = playable.videoUrl,
+                                    candidates = playable.videoUrlCandidates,
+                                )
+                            val audioBaseUrl =
+                                audioProxy.register(
+                                    kind = "a",
+                                    upstreamUrl = playable.audioUrl,
+                                    candidates = playable.audioUrlCandidates,
+                                )
                             val mpdFile =
                                 writeDashMpd(
                                     playable,
                                     durationMs = dataSource.durationMs,
+                                    videoBaseUrl = videoBaseUrl,
+                                    audioBaseUrl = audioBaseUrl,
                                 )
                             if (BuildConfig.DEBUG) {
                                 val vLen = playable.videoUrl.length
                                 val aLen = playable.audioUrl.length
                                 AppLog.i(
                                     "IjkEngine",
-                                    "dash source mode=direct mpd=${mpdFile.name} bytes=${mpdFile.length()} vUrlLen=$vLen aUrlLen=$aLen",
+                                    "dash source mode=parallel-proxy mpd=${mpdFile.name} bytes=${mpdFile.length()} vUrlLen=$vLen aUrlLen=$aLen",
                                 )
                                 if (vLen > 1024 || aLen > 1024) {
                                     AppLog.w(
@@ -343,6 +365,8 @@ internal class IjkPlayerEngine(
             runCatching { p.resetListeners() }
             runCatching { p.release() }
         }
+        dashProxies.values.forEach { proxy -> runCatching { proxy.close() } }
+        dashProxies.clear()
     }
 
     override fun addListener(listener: BlblPlayerEngine.Listener) {
@@ -580,6 +604,20 @@ internal class IjkPlayerEngine(
             )
         }
         runCatching { p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "allowed_extensions", "ALL") }
+    }
+
+    private fun dashProxyFor(profile: VideoMediaRequestProfile): DashLocalHttpProxy {
+        dashProxies[profile]?.let { return it }
+        val client =
+            when (profile) {
+                VideoMediaRequestProfile.WEB -> BiliClient.cdnOkHttp
+                VideoMediaRequestProfile.APP -> BiliClient.appCdnOkHttp
+            }
+        return DashLocalHttpProxy(
+            okHttpClient = client,
+            onTransferHost = onTransferHost,
+            onBytesTransferred = onBytesTransferred,
+        ).also { dashProxies[profile] = it }
     }
 
     internal data class IjkDebugSnapshot(

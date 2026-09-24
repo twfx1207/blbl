@@ -79,8 +79,16 @@ internal class ExoPlayerEngine(
     private val seamlessManifestFile: File = File(appContext.cacheDir, "blbl_seamless_dash_${System.identityHashCode(this)}.mpd")
 
     private val volumeBalanceProcessor = VolumeBalanceAudioProcessor(level = audioBalanceLevel)
+    private val rangeScheduler = ParallelRangeScheduler()
+    private val cdnSpeedTracker = CdnSpeedTracker()
     private val loadControl: DefaultLoadControl =
         DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                /* minBufferMs = */ 20_000,
+                /* maxBufferMs = */ 60_000,
+                /* bufferForPlaybackMs = */ 1_000,
+                /* bufferForPlaybackAfterRebufferMs = */ 2_000,
+            )
             // Keep roughly one forward buffer window behind the playhead so in-buffer seek
             // does not immediately discard media that was already fetched.
             .setBackBuffer(DefaultLoadControl.DEFAULT_MAX_BUFFER_MS, true)
@@ -391,6 +399,7 @@ internal class ExoPlayerEngine(
 
     override fun release() {
         exoPlayer.release()
+        rangeScheduler.close()
     }
 
     override fun addListener(listener: BlblPlayerEngine.Listener) {
@@ -441,8 +450,22 @@ internal class ExoPlayerEngine(
                 .filter { it.isNotBlank() }
                 .distinct()
                 .map { Uri.parse(it) }
-        if (uris.size <= 1) return upstream
-        return CdnFailoverDataSourceFactory(upstreamFactory = upstream, state = CdnFailoverState(kind = kind, candidates = uris))
+        val failoverState = CdnFailoverState(kind = kind, candidates = uris)
+        val fallbackFactory =
+            if (uris.size <= 1) {
+                upstream
+            } else {
+                CdnFailoverDataSourceFactory(upstreamFactory = upstream, state = failoverState)
+            }
+        return ParallelRangeDataSourceFactory(
+            fallbackFactory = fallbackFactory,
+            client = client,
+            candidates = uris,
+            state = failoverState,
+            scheduler = rangeScheduler,
+            speedTracker = cdnSpeedTracker,
+            onTransferHost = { host -> onTransferHost?.invoke(kind, host) },
+        )
     }
 
     private fun buildMerged(

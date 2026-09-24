@@ -1,7 +1,10 @@
 package blbl.cat3399.feature.player.engine
 
+import android.net.Uri
 import blbl.cat3399.BuildConfig
 import blbl.cat3399.core.log.AppLog
+import blbl.cat3399.feature.player.CdnFailoverState
+import blbl.cat3399.feature.player.DebugStreamKind
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -34,9 +37,19 @@ import kotlin.concurrent.thread
  */
 internal class DashLocalHttpProxy(
     private val okHttpClient: OkHttpClient,
+    private val onTransferHost: ((DebugStreamKind, String) -> Unit)? = null,
+    private val onBytesTransferred: ((DebugStreamKind, Long) -> Unit)? = null,
 ) : Closeable {
-    private val upstreamByKey: ConcurrentHashMap<String, String> = ConcurrentHashMap()
+    private data class UpstreamRegistration(
+        val kind: DebugStreamKind,
+        val candidates: List<Uri>,
+        val state: CdnFailoverState,
+    )
+
+    private val upstreamByKey: ConcurrentHashMap<String, UpstreamRegistration> = ConcurrentHashMap()
     private val debugLogCount: AtomicInteger = AtomicInteger(0)
+    private val rangeScheduler = ParallelRangeScheduler()
+    private val cdnSpeedTracker = CdnSpeedTracker()
 
     @Volatile
     private var serverSocket: ServerSocket? = null
@@ -50,12 +63,24 @@ internal class DashLocalHttpProxy(
     val port: Int
         get() = serverSocket?.localPort ?: 0
 
-    fun register(kind: String, upstreamUrl: String): String {
+    fun register(kind: String, upstreamUrl: String, candidates: List<String> = listOf(upstreamUrl)): String {
         ensureStarted()
         val k = kind.trim().lowercase(Locale.US).ifBlank { "v" }
-        val url = upstreamUrl.trim()
-        val key = md5Hex("$k|$url")
-        upstreamByKey[key] = url
+        val urls =
+            (listOf(upstreamUrl) + candidates)
+                .map(String::trim)
+                .filter(String::isNotBlank)
+                .distinct()
+                .map { Uri.parse(it) }
+        if (urls.isEmpty()) throw IllegalArgumentException("missing DASH upstream URL")
+        val debugKind = if (k == "a") DebugStreamKind.AUDIO else DebugStreamKind.VIDEO
+        val key = md5Hex("$k|${urls.joinToString(separator = "|")}")
+        upstreamByKey[key] =
+            UpstreamRegistration(
+                kind = debugKind,
+                candidates = urls,
+                state = CdnFailoverState(kind = debugKind, candidates = urls),
+            )
         return "http://127.0.0.1:${port}/${k}/${key}.m4s"
     }
 
@@ -128,8 +153,8 @@ internal class DashLocalHttpProxy(
                 return
             }
             val key = segs[1].substringBefore('.').trim()
-            val upstreamUrl = upstreamByKey[key]
-            if (upstreamUrl.isNullOrBlank()) {
+            val registration = upstreamByKey[key]
+            if (registration == null) {
                 respondPlain(s, code = 404, message = "Not Found", body = "missing key=$key")
                 return
             }
@@ -144,6 +169,27 @@ internal class DashLocalHttpProxy(
                 }
             debugIndex?.let {
                 AppLog.i("DashProxy", "req method=$method key=$key range=$range")
+            }
+            if (method == "GET" && range != null) {
+                val streamed =
+                    runCatching {
+                        streamParallelRange(
+                            socket = s,
+                            registration = registration,
+                            rangeHeader = range,
+                            debugKey = key,
+                        )
+                    }.getOrElse { throwable ->
+                        AppLog.w("DashProxy", "parallel range failed key=$key; fallback to single request", throwable)
+                        false
+                    }
+                if (streamed) return
+            }
+
+            val upstreamUrl = registration.candidates.firstOrNull()?.toString()
+            if (upstreamUrl.isNullOrBlank()) {
+                respondPlain(s, code = 502, message = "Bad Gateway", body = "missing upstream")
+                return
             }
             runCatching { executeUpstream(upstreamUrl, range = range, method = method) }
                 .onFailure { t ->
@@ -263,6 +309,76 @@ internal class DashLocalHttpProxy(
         return okHttpClient.newCall(builder.build()).execute()
     }
 
+    /**
+     * Replaces one native DASH Range request with several ordered CDN Range requests. The first
+     * piece is awaited before headers are sent; later pieces are written in file order so ffmpeg
+     * still sees one ordinary 206 response.
+     */
+    private fun streamParallelRange(
+        socket: Socket,
+        registration: UpstreamRegistration,
+        rangeHeader: String,
+        debugKey: String,
+    ): Boolean {
+        val range = parseByteRange(rangeHeader) ?: return false
+        if (
+            range.length < ParallelRangeConfig.MIN_ACCELERATED_RANGE_BYTES ||
+            range.length > ParallelRangeConfig.MAX_ACCELERATED_RANGE_BYTES
+        ) {
+            return false
+        }
+        val session =
+            runCatching {
+                ParallelRangeSession(
+                    client = okHttpClient,
+                    candidates = registration.candidates,
+                    state = registration.state,
+                    scheduler = rangeScheduler,
+                    speedTracker = cdnSpeedTracker,
+                    start = range.start,
+                    length = range.length,
+                    onHost = { host -> onTransferHost?.invoke(registration.kind, host) },
+                    onNetworkBytes = { bytes -> onBytesTransferred?.invoke(registration.kind, bytes) },
+                )
+            }.getOrElse {
+                return false
+            }
+
+        var first: ParallelRangePieceResult
+        try {
+            first = session.awaitPiece(0)
+        } catch (_: Throwable) {
+            session.close()
+            return false
+        }
+
+        val output = BufferedOutputStream(socket.getOutputStream())
+        val total = first.totalLength
+        writeStatusLine(output, code = 206, message = "Partial Content")
+        writeHeader(output, "Connection", "close")
+        writeHeader(output, "Content-Type", if (registration.kind == DebugStreamKind.AUDIO) "audio/mp4" else "video/mp4")
+        writeHeader(output, "Accept-Ranges", "bytes")
+        writeHeader(output, "Content-Range", "bytes ${range.start}-${range.end}/$total")
+        writeHeader(output, "Content-Length", range.length.toString())
+        finishHeaders(output)
+        try {
+            output.write(first.bytes)
+            for (index in 1 until session.pieces.size) {
+                val piece = session.awaitPiece(index)
+                if (piece.totalLength != total) throw IOException("parallel DASH total length changed key=$debugKey")
+                output.write(piece.bytes)
+            }
+            output.flush()
+        } catch (e: java.net.SocketException) {
+            if (BuildConfig.DEBUG) AppLog.d("DashProxy", "client closed connection key=$debugKey")
+        } catch (e: IOException) {
+            AppLog.w("DashProxy", "parallel response stream failed key=$debugKey", e)
+        } finally {
+            session.close()
+        }
+        return true
+    }
+
     private fun respondPlain(socket: Socket, code: Int, message: String, body: String) {
         val bytes = body.toByteArray(StandardCharsets.UTF_8)
         val out = BufferedOutputStream(socket.getOutputStream())
@@ -278,6 +394,10 @@ internal class DashLocalHttpProxy(
     private fun writeStatusLine(out: BufferedOutputStream, res: Response) {
         val msg = res.message.takeIf { it.isNotBlank() } ?: "OK"
         out.write("HTTP/1.1 ${res.code} $msg\r\n".toByteArray(StandardCharsets.ISO_8859_1))
+    }
+
+    private fun writeStatusLine(out: BufferedOutputStream, code: Int, message: String) {
+        out.write("HTTP/1.1 $code $message\r\n".toByteArray(StandardCharsets.ISO_8859_1))
     }
 
     private fun writeHeader(out: BufferedOutputStream, name: String, value: String) {
@@ -307,7 +427,11 @@ internal class DashLocalHttpProxy(
 
     fun stop() {
         upstreamByKey.clear()
-        val socket = serverSocket ?: return
+        val socket = serverSocket
+        if (socket == null) {
+            rangeScheduler.close()
+            return
+        }
         serverSocket = null
         runCatching { socket.close() }
 
@@ -316,6 +440,7 @@ internal class DashLocalHttpProxy(
         exec?.shutdown()
         runCatching { exec?.awaitTermination(800, TimeUnit.MILLISECONDS) }
         runCatching { exec?.shutdownNow() }
+        rangeScheduler.close()
 
         acceptThread = null
         AppLog.i("DashProxy", "stopped")
@@ -345,6 +470,13 @@ internal class DashLocalHttpProxy(
         val end = endStr.toLongOrNull() ?: return null
         if (start < 0L || end < start) return null
         return (end - start + 1L).takeIf { it >= 0L }
+    }
+
+    private fun parseByteRange(value: String): ParallelByteRange? {
+        val match = Regex("^bytes=(\\d+)-(\\d+)$", RegexOption.IGNORE_CASE).matchEntire(value.trim()) ?: return null
+        val start = match.groupValues[1].toLongOrNull() ?: return null
+        val end = match.groupValues[2].toLongOrNull() ?: return null
+        return runCatching { ParallelByteRange(start = start, end = end) }.getOrNull()
     }
 
     private fun copyToExactly(input: InputStream, out: BufferedOutputStream, bytes: Long) {

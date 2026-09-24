@@ -859,7 +859,19 @@ class PlayerActivity : BaseActivity() {
         val engine: BlblPlayerEngine =
             when (engineKind) {
                 PlayerEngineKind.IjkPlayer -> {
-                    IjkPlayerEngine(context = this)
+                    IjkPlayerEngine(
+                        context = this,
+                        onTransferHost = { kind, host ->
+                            when (kind) {
+                                DebugStreamKind.VIDEO -> debug.videoTransferHost = host
+                                DebugStreamKind.AUDIO -> debug.audioTransferHost = host
+                                DebugStreamKind.MAIN -> debug.videoTransferHost = host
+                            }
+                        },
+                        onBytesTransferred = { _, bytes ->
+                            recordBufferingTransferBytes(bytes)
+                        },
+                    )
                 }
                 PlayerEngineKind.ExoPlayer -> {
                     ExoPlayerEngine(
