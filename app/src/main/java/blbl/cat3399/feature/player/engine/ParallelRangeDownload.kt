@@ -136,6 +136,9 @@ internal class ParallelRangeScheduler(val options: RangeDownloadOptions = RangeD
         if (closed) return
         // Video deliberately leaves a normal slot for audio; that slot need not be busy to trial.
         val target = controller.update(rangeNowMs(), bufferedMs, primary.activeCount >= (primary.corePoolSize - 1).coerceAtLeast(1))
+        if (options.debug && target != primary.corePoolSize) {
+            AppLog.d("RangeAccel", "normal slots=" + primary.corePoolSize + "->" + target + " bufferMs=" + bufferedMs)
+        }
         if (target > primary.corePoolSize) {
             primary.maximumPoolSize = target
             primary.corePoolSize = target
@@ -155,6 +158,7 @@ internal class ParallelRangeScheduler(val options: RangeDownloadOptions = RangeD
         return true
     }
     @Synchronized fun release(bytes: Int) { allocatedBytes -= bytes }
+    @Synchronized fun reservedBytes(): Int = allocatedBytes
     fun register(session: ParallelRangeSession) {
         if (closed) throw RangeCanceledException("Scheduler closed")
         sessions.add(session)
@@ -232,7 +236,8 @@ internal class ParallelRangeSession(
         head.awaitHeaders()
         if (scheduler.options.debug) {
             AppLog.i("RangeAccel", "stream kind=" + state.kind + " position=" + start +
-                " length=" + resolvedLength + " connections=" + scheduler.options.connectionLimit)
+                " length=" + resolvedLength + " limit=" + scheduler.options.connectionLimit +
+                " active=" + scheduler.activeRequests + " reservedBytes=" + scheduler.reservedBytes())
         }
         return resolvedLength
     }
@@ -251,10 +256,15 @@ internal class ParallelRangeSession(
                 break
             }
             val piece = Piece(range, first)
+            val probe = first && speedTracker.speed(primary) == 0.0 &&
+                scheduler.options.rescueEnabled && candidates.size > 1
             first = false
             pending.addLast(piece)
             cursor = range.end + 1L
             piece.launch(isRescue = false, primary = primary)
+            // One bounded startup race, using the reserved lane. Unlike distributing the
+            // initial segment over unknown nodes, either response can supply the same prefix.
+            if (probe) piece.launch(isRescue = true, probe = true)
         }
     }
 
@@ -310,7 +320,7 @@ internal class ParallelRangeSession(
         private val createdAt = rangeNowMs()
         private var lastProgress = createdAt
 
-        fun launch(isRescue: Boolean, primary: Uri? = null) {
+        fun launch(isRescue: Boolean, primary: Uri? = null, probe: Boolean = false) {
             val uri = synchronized(monitor) {
                 if (disposed || closed || (headers && filled >= size) || attempts >= 3) return
                 val ranked = ordered(balance = !isHead)
@@ -326,14 +336,15 @@ internal class ParallelRangeSession(
                 chosen
             }
             try {
-                if (isRescue) calls.values.filter { it != uri }.forEach(speedTracker::recordFailure)
+                if (isRescue && !probe) calls.values.filter { it != uri }.forEach(speedTracker::recordFailure)
                 val job = scheduler.submit(
                     priority = if (isRescue || isHead) 0 else if (state.kind == DebugStreamKind.AUDIO) 1 else 10,
                     isRescue = isRescue,
                 ) { download(uri) }
                 jobs.add(job)
                 if (synchronized(monitor) { disposed }) scheduler.cancel(job)
-                if (isRescue && scheduler.options.debug) AppLog.d("RangeAccel", "rescue tail host=" + uri.host)
+                if (isRescue && scheduler.options.debug) AppLog.d("RangeAccel",
+                    (if (probe) "startup probe host=" else "rescue tail host=") + uri.host)
             } catch (e: RuntimeException) {
                 synchronized(monitor) {
                     running--
@@ -407,6 +418,7 @@ internal class ParallelRangeSession(
         private fun download(uri: Uri) {
             var call: Call? = null
             var useful = 0L
+            var received = 0L
             val startedAt = rangeNowMs()
             speedTracker.started(uri)
             try {
@@ -459,6 +471,7 @@ internal class ParallelRangeSession(
                             val count = input.read(scratch, 0, minOf(scratch.size, expected - position))
                             if (count < 0) throw IOException("Truncated range body")
                             if (count == 0) continue
+                            received += count
                             onNetworkBytes?.invoke(count.toLong())
                             val added = publish(position, scratch, count)
                             useful += added
@@ -477,8 +490,10 @@ internal class ParallelRangeSession(
                 synchronized(monitor) { error = IOException("Range request failed", e) }
             } finally {
                 val completed = synchronized(monitor) { headers && filled >= size }
-                if (completed && useful > 0L) {
-                    speedTracker.recordSuccess(uri, useful, rangeNowMs() - startedAt)
+                if (completed && (useful > 0L || received >= 16L * 1024L)) {
+                    // A losing probe with enough received data still teaches us about that
+                    // node. Only useful bytes affect the concurrency controller above.
+                    speedTracker.recordSuccess(uri, received, rangeNowMs() - startedAt)
                     val best = ordered().firstOrNull()
                     val index = candidates.indexOf(best)
                     if (index >= 0) state.prefer(state.candidates.indexOf(candidates[index]).coerceAtLeast(0))
