@@ -38,6 +38,7 @@ import kotlin.concurrent.thread
  */
 internal class DashLocalHttpProxy(
     private val okHttpClient: OkHttpClient,
+    private val rangeScheduler: ParallelRangeScheduler = ParallelRangeScheduler(),
     private val onTransferHost: ((DebugStreamKind, String) -> Unit)? = null,
     private val onBytesTransferred: ((DebugStreamKind, Long) -> Unit)? = null,
 ) : Closeable {
@@ -49,7 +50,6 @@ internal class DashLocalHttpProxy(
 
     private val upstreamByKey: ConcurrentHashMap<String, UpstreamRegistration> = ConcurrentHashMap()
     private val debugLogCount: AtomicInteger = AtomicInteger(0)
-    private val rangeScheduler = ParallelRangeScheduler()
     private val cdnSpeedTracker = CdnSpeedTracker()
 
     @Volatile
@@ -86,6 +86,7 @@ internal class DashLocalHttpProxy(
     }
 
     fun resetRegistrations() {
+        rangeScheduler.cancelAll()
         upstreamByKey.clear()
     }
 
@@ -310,70 +311,59 @@ internal class DashLocalHttpProxy(
         return okHttpClient.newCall(builder.build()).execute()
     }
 
-    /**
-     * Replaces one native DASH Range request with several ordered CDN Range requests. The first
-     * piece is awaited before headers are sent; later pieces are written in file order so ffmpeg
-     * still sees one ordinary 206 response.
-     */
+    /** One ordinary 206 response, streamed as contiguous bytes arrive from the range window. */
     private fun streamParallelRange(
         socket: Socket,
         registration: UpstreamRegistration,
         rangeHeader: String,
         debugKey: String,
     ): Boolean {
+        if (!rangeScheduler.options.enabled) return false
         val range = parseByteRange(rangeHeader) ?: return false
-        if (
-            range.length < ParallelRangeConfig.MIN_ACCELERATED_RANGE_BYTES ||
-            range.length > ParallelRangeConfig.MAX_ACCELERATED_RANGE_BYTES
-        ) {
-            return false
-        }
-        val session =
-            runCatching {
-                ParallelRangeSession(
-                    client = okHttpClient,
-                    candidates = registration.candidates,
-                    state = registration.state,
-                    scheduler = rangeScheduler,
-                    speedTracker = cdnSpeedTracker,
-                    start = range.start,
-                    length = range.length,
-                    onHost = { host -> onTransferHost?.invoke(registration.kind, host) },
-                    onNetworkBytes = { bytes -> onBytesTransferred?.invoke(registration.kind, bytes) },
-                )
-            }.getOrElse {
-                return false
-            }
-
-        var first: ParallelRangePieceResult
+        val session = ParallelRangeSession(
+            client = okHttpClient,
+            candidates = registration.candidates,
+            state = registration.state,
+            scheduler = rangeScheduler,
+            speedTracker = cdnSpeedTracker,
+            start = range.start,
+            length = range.length,
+            onHost = { host -> onTransferHost?.invoke(registration.kind, host) },
+            onNetworkBytes = { bytes -> onBytesTransferred?.invoke(registration.kind, bytes) },
+        )
         try {
-            first = session.awaitPiece(0)
-        } catch (_: Throwable) {
-            session.close()
-            return false
-        }
-
-        val output = BufferedOutputStream(socket.getOutputStream())
-        val total = first.totalLength
-        writeStatusLine(output, code = 206, message = "Partial Content")
-        writeHeader(output, "Connection", "close")
-        writeHeader(output, "Content-Type", if (registration.kind == DebugStreamKind.AUDIO) "audio/mp4" else "video/mp4")
-        writeHeader(output, "Accept-Ranges", "bytes")
-        writeHeader(output, "Content-Range", "bytes ${range.start}-${range.end}/$total")
-        writeHeader(output, "Content-Length", range.length.toString())
-        finishHeaders(output)
-        try {
-            output.write(first.bytes)
-            for (index in 1 until session.pieces.size) {
-                val piece = session.awaitPiece(index)
-                if (piece.totalLength != total) throw IOException("parallel DASH total length changed key=$debugKey")
-                output.write(piece.bytes)
-            }
-            output.flush()
-        } catch (e: java.net.SocketException) {
-            if (BuildConfig.DEBUG) AppLog.d("DashProxy", "client closed connection key=$debugKey")
+            session.open()
         } catch (e: IOException) {
-            AppLog.w("DashProxy", "parallel response stream failed key=$debugKey", e)
+            session.close()
+            if (e is RangeCanceledException) {
+                runCatching { socket.close() }
+                return true
+            }
+            return false
+        }
+        // Once headers have been written, never append a second HTTP response on this socket.
+        try {
+            val output = BufferedOutputStream(socket.getOutputStream())
+            writeStatusLine(output, code = 206, message = "Partial Content")
+            writeHeader(output, "Connection", "close")
+            writeHeader(output, "Content-Type", if (registration.kind == DebugStreamKind.AUDIO) "audio/mp4" else "video/mp4")
+            writeHeader(output, "Accept-Ranges", "bytes")
+            writeHeader(output, "Content-Range", "bytes " + range.start + "-" +
+                (range.start + session.resolvedLength - 1L) + "/" + session.totalLength)
+            writeHeader(output, "Content-Length", session.resolvedLength.toString())
+            finishHeaders(output)
+            output.flush()
+            val buffer = ByteArray(16 * 1024)
+            while (true) {
+                val count = session.read(buffer, 0, buffer.size)
+                if (count < 0) break
+                output.write(buffer, 0, count)
+                output.flush()
+            }
+        } catch (e: java.net.SocketException) {
+            if (BuildConfig.DEBUG) AppLog.d("DashProxy", "client closed key=" + debugKey)
+        } catch (e: IOException) {
+            AppLog.w("DashProxy", "range stream interrupted key=" + debugKey, e)
         } finally {
             session.close()
         }

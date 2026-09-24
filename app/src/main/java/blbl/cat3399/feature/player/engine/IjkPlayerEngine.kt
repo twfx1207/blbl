@@ -25,6 +25,8 @@ internal class IjkPlayerEngine(
     private val onBytesTransferred: ((kind: DebugStreamKind, bytesTransferred: Long) -> Unit)? = null,
 ) : BlblPlayerEngine {
     private val appContext: Context = context.applicationContext
+    private val rangeOptions = loadRangeDownloadOptions(appContext)
+    private val rangeScheduler = ParallelRangeScheduler(rangeOptions)
     private val listeners: MutableSet<BlblPlayerEngine.Listener> = CopyOnWriteArraySet()
     private val dashProxies = LinkedHashMap<VideoMediaRequestProfile, DashLocalHttpProxy>()
 
@@ -118,6 +120,7 @@ internal class IjkPlayerEngine(
 
     override fun seekTo(positionMs: Long) {
         val p = ijk ?: return
+        rangeScheduler.cancelAll()
         val pos = positionMs.coerceAtLeast(0L)
         val leavesEndedState = seekLeavesEndedState(pos)
         val vod = source as? PlaybackSource.Vod
@@ -235,13 +238,13 @@ internal class IjkPlayerEngine(
                             videoProxy.resetRegistrations()
                             if (audioProxy !== videoProxy) audioProxy.resetRegistrations()
                             val videoBaseUrl =
-                                videoProxy.register(
+                                if (!rangeOptions.enabled) playable.videoUrl else videoProxy.register(
                                     kind = "v",
                                     upstreamUrl = playable.videoUrl,
                                     candidates = playable.videoUrlCandidates,
                                 )
                             val audioBaseUrl =
-                                audioProxy.register(
+                                if (!rangeOptions.enabled) playable.audioUrl else audioProxy.register(
                                     kind = "a",
                                     upstreamUrl = playable.audioUrl,
                                     candidates = playable.audioUrlCandidates,
@@ -337,6 +340,7 @@ internal class IjkPlayerEngine(
     }
 
     override fun stop() {
+        rangeScheduler.cancelAll()
         val p = ijk ?: return
         runCatching { p.stop() }
         prepared = false
@@ -349,6 +353,7 @@ internal class IjkPlayerEngine(
     }
 
     override fun release() {
+        rangeScheduler.close()
         source = null
         playWhenReadyInternal = false
         prepared = false
@@ -615,6 +620,7 @@ internal class IjkPlayerEngine(
             }
         return DashLocalHttpProxy(
             okHttpClient = client,
+            rangeScheduler = rangeScheduler,
             onTransferHost = onTransferHost,
             onBytesTransferred = onBytesTransferred,
         ).also { dashProxies[profile] = it }

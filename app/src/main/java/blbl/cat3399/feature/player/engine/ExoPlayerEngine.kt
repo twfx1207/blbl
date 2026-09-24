@@ -4,6 +4,7 @@ package blbl.cat3399.feature.player.engine
 
 import android.content.Context
 import android.net.Uri
+import android.os.Handler
 import android.os.SystemClock
 import android.view.Surface
 import androidx.media3.common.C
@@ -79,16 +80,11 @@ internal class ExoPlayerEngine(
     private val seamlessManifestFile: File = File(appContext.cacheDir, "blbl_seamless_dash_${System.identityHashCode(this)}.mpd")
 
     private val volumeBalanceProcessor = VolumeBalanceAudioProcessor(level = audioBalanceLevel)
-    private val rangeScheduler = ParallelRangeScheduler()
+    private val rangeOptions = loadRangeDownloadOptions(appContext)
+    private val rangeScheduler = ParallelRangeScheduler(rangeOptions)
     private val cdnSpeedTracker = CdnSpeedTracker()
     private val loadControl: DefaultLoadControl =
         DefaultLoadControl.Builder()
-            .setBufferDurationsMs(
-                /* minBufferMs = */ 20_000,
-                /* maxBufferMs = */ 60_000,
-                /* bufferForPlaybackMs = */ 1_000,
-                /* bufferForPlaybackAfterRebufferMs = */ 2_000,
-            )
             // Keep roughly one forward buffer window behind the playhead so in-buffer seek
             // does not immediately discard media that was already fetched.
             .setBackBuffer(DefaultLoadControl.DEFAULT_MAX_BUFFER_MS, true)
@@ -105,6 +101,14 @@ internal class ExoPlayerEngine(
             .setVideoChangeFrameRateStrategy(C.VIDEO_CHANGE_FRAME_RATE_STRATEGY_OFF)
             .build()
 
+    // Read player state only on its application looper, never on a downloader thread.
+    private val rangeHandler = Handler(exoPlayer.applicationLooper)
+    private val rangeFeedback = object : Runnable {
+        override fun run() {
+            rangeScheduler.updatePlayback((exoPlayer.bufferedPosition - exoPlayer.currentPosition).coerceAtLeast(0L))
+            rangeHandler.postDelayed(this, 500L)
+        }
+    }
     private val listeners: MutableSet<BlblPlayerEngine.Listener> = CopyOnWriteArraySet()
     private var seamlessQualitySource: Boolean = false
     private var seamlessAvailableQns: Set<Int> = emptySet()
@@ -221,6 +225,7 @@ internal class ExoPlayerEngine(
         }
 
     init {
+        if (rangeOptions.enabled) rangeHandler.post(rangeFeedback)
         exoPlayer.addListener(
             object : Player.Listener {
                 override fun onPlayerError(error: PlaybackException) {
@@ -398,6 +403,8 @@ internal class ExoPlayerEngine(
     }
 
     override fun release() {
+        rangeHandler.removeCallbacks(rangeFeedback)
+        rangeScheduler.cancelAll()
         exoPlayer.release()
         rangeScheduler.close()
     }
@@ -457,6 +464,7 @@ internal class ExoPlayerEngine(
             } else {
                 CdnFailoverDataSourceFactory(upstreamFactory = upstream, state = failoverState)
             }
+        if (!rangeOptions.enabled) return fallbackFactory
         return ParallelRangeDataSourceFactory(
             fallbackFactory = fallbackFactory,
             client = client,
@@ -465,6 +473,7 @@ internal class ExoPlayerEngine(
             scheduler = rangeScheduler,
             speedTracker = cdnSpeedTracker,
             onTransferHost = { host -> onTransferHost?.invoke(kind, host) },
+            onNetworkBytes = { bytes -> onBytesTransferred?.invoke(kind, bytes) },
         )
     }
 

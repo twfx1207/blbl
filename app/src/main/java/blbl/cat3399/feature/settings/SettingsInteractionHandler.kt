@@ -1234,6 +1234,51 @@ class SettingsInteractionHandler(
                 renderer.refreshSection(entry.id)
             }
 
+            SettingId.RangeDownloadEnabled,
+            SettingId.RangeDownloadAutomatic,
+            SettingId.RangeDownloadRescue,
+            SettingId.RangeDownloadDebug -> {
+                when (entry.id) {
+                    SettingId.RangeDownloadEnabled -> prefs.rangeDownloadEnabled = !prefs.rangeDownloadEnabled
+                    SettingId.RangeDownloadAutomatic -> prefs.rangeDownloadAutomatic = !prefs.rangeDownloadAutomatic
+                    SettingId.RangeDownloadRescue -> prefs.rangeDownloadRescue = !prefs.rangeDownloadRescue
+                    SettingId.RangeDownloadDebug -> prefs.rangeDownloadDebug = !prefs.rangeDownloadDebug
+                    else -> Unit
+                }
+                AppToast.show(activity, "下载加速设置已保存（下次进入播放生效）")
+                renderer.refreshSection(entry.id)
+            }
+            SettingId.RangeDownloadConnections,
+            SettingId.RangeDownloadMemory -> {
+                val memory = entry.id == SettingId.RangeDownloadMemory
+                val values = if (memory) listOf(2, 4, 8) else listOf(2, 4, 6, 8)
+                val current = if (memory) prefs.rangeDownloadMemoryMiB else prefs.rangeDownloadConnections
+                val labels = values.map { it.toString() + if (memory) " MiB" else " 个" }
+                showChoiceDialog(
+                    title = entry.title,
+                    items = labels,
+                    checkedIndex = values.indexOf(current).coerceAtLeast(0),
+                ) { selected ->
+                    val value = values[labels.indexOf(selected).coerceAtLeast(0)]
+                    if (memory) prefs.rangeDownloadMemoryMiB = value else prefs.rangeDownloadConnections = value
+                    AppToast.show(activity, "已保存（下次进入播放生效）")
+                    renderer.refreshSection(entry.id)
+                }
+            }
+            SettingId.RangeDownloadCdnMode -> {
+                val values = listOf("auto", "mainland", "overseas")
+                val labels = listOf("自动测速优选", "大陆节点优先", "海外节点优先")
+                showChoiceDialog(
+                    title = "CDN 优先策略",
+                    items = labels,
+                    checkedIndex = values.indexOf(prefs.rangeDownloadCdnMode).coerceAtLeast(0),
+                ) { selected ->
+                    prefs.rangeDownloadCdnMode = values[labels.indexOf(selected).coerceAtLeast(0)]
+                    AppToast.show(activity, "已保存（下次进入播放生效）")
+                    renderer.refreshSection(entry.id)
+                }
+            }
+
             SettingId.PlayerCdnPreference -> {
                 val options =
                     listOf(

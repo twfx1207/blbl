@@ -3,404 +3,512 @@
 package blbl.cat3399.feature.player.engine
 
 import android.net.Uri
+import android.os.SystemClock
 import androidx.media3.common.C
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
 import blbl.cat3399.core.log.AppLog
 import blbl.cat3399.feature.player.CdnFailoverState
+import blbl.cat3399.feature.player.DebugStreamKind
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.Closeable
 import java.io.IOException
+import java.io.InterruptedIOException
+import java.util.ArrayDeque
+import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.ExecutionException
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.FutureTask
+import java.util.concurrent.PriorityBlockingQueue
 import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.math.ceil
 
-/** A bounded byte range with inclusive endpoints. */
-internal data class ParallelByteRange(
-    val start: Long,
-    val end: Long,
-) {
-    init {
-        require(start >= 0L) { "range start must be non-negative" }
-        require(end >= start) { "range end must not precede start" }
+private fun rangeNowMs(): Long = SystemClock.elapsedRealtime()
+
+// SocketTimeoutException also extends InterruptedIOException; it MUST still permit fallback.
+internal class RangeCanceledException(message: String) : InterruptedIOException(message)
+
+/** Measured hosts are preferred; unsupported ranges are remembered per resource. No URL rewriting. */
+internal class CdnSpeedTracker {
+    private data class Entry(var speed: Double = 0.0, var blockedUntil: Long = 0L, var active: Int = 0)
+    private val hosts = LinkedHashMap<String, Entry>()
+    private val unsupported = LinkedHashMap<String, Long>()
+    private var probeCursor = 0
+    private fun host(uri: Uri) = uri.host.orEmpty().lowercase(Locale.US)
+    private fun resource(uri: Uri) = host(uri) + uri.encodedPath.orEmpty()
+    private fun entry(uri: Uri): Entry = hosts.getOrPut(host(uri)) { Entry() }
+
+    @Synchronized
+    fun supportsRange(uri: Uri): Boolean = (unsupported[resource(uri)] ?: 0L) <= rangeNowMs()
+
+    @Synchronized
+    fun markUnsupported(uri: Uri) {
+        unsupported[resource(uri)] = rangeNowMs() + 300_000L
+        if (unsupported.size > 128) unsupported.remove(unsupported.keys.first())
     }
 
-    val length: Long
-        get() = end - start + 1L
-}
-
-internal object ParallelRangePlanner {
-    fun split(
-        start: Long,
-        length: Long,
-        maxPieces: Int = ParallelRangeConfig.MAX_PIECES,
-        minPieceBytes: Long = ParallelRangeConfig.MIN_PIECE_BYTES,
-    ): List<ParallelByteRange> {
-        require(start >= 0L) { "range start must be non-negative" }
-        require(length > 0L) { "range length must be positive" }
-        val safeMaxPieces = maxPieces.coerceIn(1, ParallelRangeConfig.MAX_PIECES)
-        val safeMinimum = minPieceBytes.coerceAtLeast(32L * 1024L)
-        val count =
-            ceil(length.toDouble() / safeMinimum.toDouble())
-                .toInt()
-                .coerceIn(1, safeMaxPieces)
-        val base = length / count.toLong()
-        val remainder = (length % count.toLong()).toInt()
-        val result = ArrayList<ParallelByteRange>(count)
-        var cursor = start
-        repeat(count) { index ->
-            val pieceLength = base + if (index < remainder) 1L else 0L
-            val end = cursor + pieceLength - 1L
-            result += ParallelByteRange(start = cursor, end = end)
-            cursor = end + 1L
+    @Synchronized
+    fun ordered(candidates: List<Uri>, preferred: Int, mode: String = "auto", balance: Boolean = false, explore: Boolean = false): List<Uri> {
+        val now = rangeNowMs()
+        val rotated = candidates.indices.map { candidates[(preferred + it) % candidates.size] }
+        fun region(uri: Uri): Int {
+            val h = host(uri)
+            val overseas = h.endsWith(".akamaized.net") || h.contains("-ov-") || h.contains("oversea")
+            return when (mode) {
+                "mainland" -> if (overseas) 1 else 0
+                "overseas" -> if (overseas) 0 else 1
+                else -> 0
+            }
         }
-        return result
+        val ranked = rotated.filter(::supportsRange).sortedWith(
+            compareBy<Uri> { entry(it).blockedUntil > now }
+                .thenBy { region(it) }
+                .thenByDescending {
+                    val e = entry(it)
+                    e.speed / if (balance) (e.active + 1).toDouble() else 1.0
+                },
+        )
+        // Explore only in ahead-of-playback work, never force an unknown host onto the head.
+        if (explore && probeCursor++ % 8 == 0) {
+            val probe = ranked.firstOrNull { entry(it).speed == 0.0 && entry(it).blockedUntil <= now }
+            if (probe != null) return listOf(probe) + ranked.filter { it != probe }
+        }
+        return ranked
+    }
+
+    @Synchronized fun started(uri: Uri) { entry(uri).active++ }
+    @Synchronized fun finished(uri: Uri) { entry(uri).let { it.active = (it.active - 1).coerceAtLeast(0) } }
+    @Synchronized fun speed(uri: Uri): Double = entry(uri).speed
+
+    @Synchronized
+    fun recordSuccess(uri: Uri, bytes: Long, elapsedMs: Long) {
+        if (bytes <= 0L) return
+        val e = entry(uri)
+        val sample = bytes * 1000.0 / elapsedMs.coerceAtLeast(1L)
+        e.speed = if (e.speed == 0.0) sample else e.speed * 0.65 + sample * 0.35
+        e.blockedUntil = 0L
+    }
+
+    @Synchronized fun recordFailure(uri: Uri) {
+        val e = entry(uri)
+        e.speed *= 0.5
+        e.blockedUntil = rangeNowMs() + 5_000L
     }
 }
 
-internal data class ParallelContentRange(
-    val start: Long,
-    val end: Long,
-    val total: Long,
-) {
-    val length: Long
-        get() = end - start + 1L
-}
+/** Shared per player: bounded memory, priority normal queue and a reserved tail-rescue lane. */
+internal class ParallelRangeScheduler(val options: RangeDownloadOptions = RangeDownloadOptions()) : Closeable {
+    private class Job(val priority: Int, val sequence: Long, action: () -> Unit) :
+        FutureTask<Unit>(Callable { action(); Unit }), Comparable<Job> {
+        override fun compareTo(other: Job): Int =
+            priority.compareTo(other.priority).takeIf { it != 0 } ?: sequence.compareTo(other.sequence)
+    }
+    private val sequence = AtomicLong()
+    private val normalLimit = options.connectionLimit - if (options.rescueEnabled) 1 else 0
+    private val controller = RangeConcurrencyController(normalLimit)
+    private fun pool(count: Int, name: String): ThreadPoolExecutor =
+        ThreadPoolExecutor(
+            count, count, 30L, TimeUnit.SECONDS,
+            PriorityBlockingQueue<Runnable>(11, Comparator { a, b -> (a as Job).compareTo(b as Job) }),
+            ThreadFactory { r -> Thread(r, name).apply { isDaemon = true } },
+        ).apply { allowCoreThreadTimeOut(true) }
+    private val primary = pool(if (options.automatic) controller.limit else normalLimit, "blbl-range")
+    private val rescue = pool(1, "blbl-range-rescue")
+    private val sessions = Collections.newSetFromMap(ConcurrentHashMap<ParallelRangeSession, Boolean>())
+    private var allocatedBytes = 0
+    @Volatile private var closed = false
+    @Volatile var bufferedMs: Long = 0L
+        private set
+    val primaryCapacity: Int get() = primary.corePoolSize
+    val activeRequests: Int get() = primary.activeCount + rescue.activeCount
 
-internal fun parseParallelContentRange(value: String?): ParallelContentRange? {
-    val raw = value?.trim().orEmpty()
-    if (raw.isBlank()) return null
-    val match = Regex("^bytes\\s+(\\d+)-(\\d+)/(\\d+|\\*)$", RegexOption.IGNORE_CASE).matchEntire(raw) ?: return null
-    val start = match.groupValues[1].toLongOrNull() ?: return null
-    val end = match.groupValues[2].toLongOrNull() ?: return null
-    val total = match.groupValues[3].toLongOrNull() ?: return null
-    if (start < 0L || end < start || total <= end) return null
-    return ParallelContentRange(start = start, end = end, total = total)
+    @Synchronized fun updatePlayback(bufferMs: Long) {
+        bufferedMs = bufferMs.coerceAtLeast(0L)
+        if (!options.automatic) return
+        if (closed) return
+        // Video deliberately leaves a normal slot for audio; that slot need not be busy to trial.
+        val target = controller.update(rangeNowMs(), bufferedMs, primary.activeCount >= (primary.corePoolSize - 1).coerceAtLeast(1))
+        if (target > primary.corePoolSize) {
+            primary.maximumPoolSize = target
+            primary.corePoolSize = target
+        } else if (target < primary.corePoolSize) {
+            primary.corePoolSize = target
+            primary.maximumPoolSize = target
+        }
+    }
+    fun usefulBytes(count: Int) {
+        controller.record(count)
+        if (options.automatic) updatePlayback(bufferedMs)
+    }
+    @Synchronized fun reserve(bytes: Int, critical: Boolean): Boolean {
+        val limit = options.memoryBytes - if (critical) 0 else 2 * ParallelRangeConfig.HEAD_BYTES
+        if (allocatedBytes + bytes > limit) return false
+        allocatedBytes += bytes
+        return true
+    }
+    @Synchronized fun release(bytes: Int) { allocatedBytes -= bytes }
+    fun register(session: ParallelRangeSession) {
+        if (closed) throw RangeCanceledException("Scheduler closed")
+        sessions.add(session)
+        if (closed) {
+            session.close()
+            throw RangeCanceledException("Scheduler closed")
+        }
+    }
+    fun unregister(session: ParallelRangeSession) { sessions.remove(session) }
+    fun cancelAll() { sessions.toList().forEach { it.close() } }
+    fun submit(priority: Int, isRescue: Boolean, action: () -> Unit): Future<*> {
+        val job = Job(priority, sequence.getAndIncrement(), action)
+        (if (isRescue) rescue else primary).execute(job)
+        return job
+    }
+    fun cancel(job: Future<*>) {
+        job.cancel(true)
+        if (job is Runnable) {
+            primary.remove(job)
+            rescue.remove(job)
+        }
+    }
+    override fun close() {
+        closed = true
+        cancelAll()
+        primary.shutdownNow()
+        rescue.shutdownNow()
+    }
 }
 
 /**
- * Small per-player CDN memory. A URL that delivers data is preferred next time, while a
- * repeatedly empty response is temporarily cooled down. The first piece of each range still
- * rotates through the candidates so a fast node is discovered instead of being assumed.
+ * The reader sees a contiguous prefix immediately, not a Future<ByteArray>.
+ * Only a small rolling window exists. A hedge requests the missing tail and publishes into
+ * the SAME prefix buffer; overlapping bytes are ignored, so no duplicated bytes reach the decoder.
  */
-internal class CdnSpeedTracker {
-    private data class Entry(
-        var bytesPerSecond: Double = 0.0,
-        var failures: Int = 0,
-        var blockedUntilMs: Long = 0L,
-    )
-
-    private val entries = ConcurrentHashMap<String, Entry>()
-
-    fun ordered(candidates: List<Uri>, startIndex: Int, nowMs: Long = System.currentTimeMillis()): List<Uri> {
-        if (candidates.isEmpty()) return emptyList()
-        val rotated =
-            candidates.indices
-                .map { offset -> candidates[(startIndex + offset) % candidates.size] }
-        val available = rotated.filter { entry(it, nowMs).blockedUntilMs <= nowMs }
-        val pool = available.ifEmpty { rotated }
-        val primary = pool.firstOrNull() ?: return emptyList()
-        return listOf(primary) +
-            pool
-                .drop(1)
-                .sortedWith(
-                    compareByDescending<Uri> { entry(it, nowMs).bytesPerSecond }
-                        .thenBy { it.toString() },
-                )
-    }
-
-    fun recordSuccess(uri: Uri, bytes: Long, elapsedMs: Long) {
-        if (bytes <= 0L || elapsedMs <= 0L) return
-        val current = entry(uri, System.currentTimeMillis())
-        val bps = bytes.toDouble() * 1000.0 / elapsedMs.toDouble()
-        synchronized(current) {
-            current.bytesPerSecond =
-                if (current.bytesPerSecond > 0.0) {
-                    current.bytesPerSecond * 0.7 + bps * 0.3
-                } else {
-                    bps
-                }
-            current.failures = 0
-            current.blockedUntilMs = 0L
-        }
-    }
-
-    fun recordFailure(uri: Uri, receivedBytes: Long) {
-        if (receivedBytes > 0L) return
-        val current = entry(uri, System.currentTimeMillis())
-        synchronized(current) {
-            current.failures = (current.failures + 1).coerceAtMost(8)
-            val backoffMs = (3_000L * (1L shl (current.failures - 1).coerceIn(0, 4))).coerceAtMost(60_000L)
-            current.blockedUntilMs = System.currentTimeMillis() + backoffMs
-        }
-    }
-
-    fun reset() {
-        entries.clear()
-    }
-
-    private fun entry(uri: Uri, nowMs: Long): Entry {
-        val key = routeKey(uri)
-        val value = entries.getOrPut(key) { Entry() }
-        synchronized(value) {
-            if (value.blockedUntilMs <= nowMs) value.blockedUntilMs = 0L
-        }
-        return value
-    }
-
-    private fun routeKey(uri: Uri): String =
-        buildString {
-            append(uri.host.orEmpty().lowercase(Locale.US))
-            append(uri.encodedPath.orEmpty())
-        }
-}
-
-internal object ParallelRangeConfig {
-    const val MIN_ACCELERATED_RANGE_BYTES: Long = 256L * 1024L
-    const val MIN_PIECE_BYTES: Long = 128L * 1024L
-    const val MAX_PIECES: Int = 8
-    const val MAX_ACCELERATED_RANGE_BYTES: Long = 64L * 1024L * 1024L
-    const val MAX_ATTEMPTS_PER_PIECE: Int = 4
-    const val CALL_TIMEOUT_MS: Long = 30_000L
-    const val DEFAULT_CONCURRENCY: Int = 8
-}
-
-internal class ParallelRangeScheduler(
-    maxConcurrency: Int = ParallelRangeConfig.DEFAULT_CONCURRENCY,
-) : Closeable {
-    private val threadCounter = AtomicInteger(0)
-    private val executor: ExecutorService =
-        Executors.newFixedThreadPool(
-            maxConcurrency.coerceIn(1, ParallelRangeConfig.MAX_PIECES),
-            ThreadFactory { runnable ->
-                Thread(runnable, "blbl-range-${threadCounter.incrementAndGet()}").apply {
-                    isDaemon = true
-                }
-            },
-        )
-
-    fun <T> submit(task: Callable<T>): Future<T> = executor.submit(task)
-
-    override fun close() {
-        executor.shutdownNow()
-        runCatching { executor.awaitTermination(800L, TimeUnit.MILLISECONDS) }
-    }
-}
-
-private class RangeCancellation {
-    private val canceled = AtomicBoolean(false)
-    private val calls = CopyOnWriteArrayList<Call>()
-
-    fun register(call: Call) {
-        if (canceled.get()) {
-            call.cancel()
-        } else {
-            calls += call
-            if (canceled.get()) call.cancel()
-        }
-    }
-
-    fun unregister(call: Call) {
-        calls.remove(call)
-    }
-
-    fun cancel() {
-        if (!canceled.compareAndSet(false, true)) return
-        calls.forEach { it.cancel() }
-        calls.clear()
-    }
-
-    fun throwIfCanceled() {
-        if (canceled.get() || Thread.currentThread().isInterrupted) {
-            throw IOException("parallel range download cancelled")
-        }
-    }
-}
-
-internal data class ParallelRangePieceResult(
-    val bytes: ByteArray,
-    val totalLength: Long,
-    val url: Uri,
-)
-
 internal class ParallelRangeSession(
     private val client: OkHttpClient,
     candidates: List<Uri>,
     private val state: CdnFailoverState,
     private val scheduler: ParallelRangeScheduler,
     private val speedTracker: CdnSpeedTracker,
-    start: Long,
-    length: Long,
+    private val start: Long,
+    private val length: Long,
     private val requestHeaders: Map<String, String> = emptyMap(),
     private val onHost: ((String) -> Unit)? = null,
     private val onNetworkBytes: ((Long) -> Unit)? = null,
 ) : Closeable {
-    val pieces: List<ParallelByteRange> = ParallelRangePlanner.split(start = start, length = length)
-
-    private val candidateUris = candidates.distinct()
-    private val cancellation = RangeCancellation()
-    private val expectedTotal = AtomicLong(-1L)
-    private val futures: List<Future<ParallelRangePieceResult>>
-
-    @Volatile
-    private var closed = false
+    private val candidates = candidates.distinct()
+    private val total = AtomicLong(-1L)
+    private val lock = Any()
+    private val pending = ArrayDeque<Piece>()
+    private var cursor = start
+    private var first = true
+    @Volatile private var headComplete = false
+    @Volatile private var end = if (length == C.LENGTH_UNSET.toLong()) Long.MAX_VALUE - 1L else start + length - 1L
+    @Volatile private var closed = false
+    val totalLength: Long get() = total.get()
+    val resolvedLength: Long get() = end - start + 1L
 
     init {
-        require(candidateUris.isNotEmpty()) { "parallel range download needs a CDN candidate" }
-        futures =
-            pieces.mapIndexed { index, piece ->
-                scheduler.submit(Callable { downloadPiece(index = index, piece = piece) })
-            }
+        require(start >= 0L && (length == -1L || (length > 0L && length <= Long.MAX_VALUE - start)))
+        require(this.candidates.isNotEmpty())
+        scheduler.register(this)
     }
 
-    fun awaitPiece(index: Int): ParallelRangePieceResult {
-        if (index !in futures.indices) throw IndexOutOfBoundsException("piece=$index size=${futures.size}")
-        if (closed) throw IOException("parallel range session closed")
-        return try {
-            futures[index].get()
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw IOException("parallel range wait interrupted", e)
-        } catch (e: ExecutionException) {
-            val cause = e.cause
-            throw when (cause) {
-                is IOException -> cause
-                else -> IOException("parallel range piece failed", cause)
-            }
+    private fun ordered(balance: Boolean = false) =
+        speedTracker.ordered(candidates, state.getPreferredIndex(), scheduler.options.cdnMode, balance,
+            explore = balance && scheduler.bufferedMs >= 8_000L)
+
+    fun open(): Long {
+        headComplete = scheduler.bufferedMs >= 3_000L &&
+            ordered().firstOrNull()?.let { speedTracker.speed(it) > 0.0 } == true
+        refill()
+        val head = synchronized(lock) { pending.peekFirst() } ?: throw IOException("No range head")
+        head.awaitHeaders()
+        if (scheduler.options.debug) {
+            AppLog.i("RangeAccel", "stream kind=" + state.kind + " position=" + start +
+                " length=" + resolvedLength + " connections=" + scheduler.options.connectionLimit)
         }
+        return resolvedLength
+    }
+
+    private fun refill() = synchronized(lock) {
+        checkOpen()
+        val window =
+            if (!headComplete || state.kind == DebugStreamKind.AUDIO) 1
+            else (scheduler.primaryCapacity - 1).coerceIn(1, 6)
+        while (pending.size < window && cursor <= end) {
+            val primary = ordered(balance = pending.isNotEmpty()).firstOrNull() ?: throw IOException("Range unavailable")
+            val range = ParallelRangePlanner.next(cursor, end, first && !headComplete, speedTracker.speed(primary))
+            val critical = pending.isEmpty()
+            if (!scheduler.reserve(range.length.toInt(), critical)) {
+                if (critical) throw IOException("Range memory budget exhausted")
+                break
+            }
+            val piece = Piece(range, first)
+            first = false
+            pending.addLast(piece)
+            cursor = range.end + 1L
+            piece.launch(isRescue = false, primary = primary)
+        }
+    }
+
+    fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        if (length == 0) return 0
+        while (true) {
+            refill()
+            val piece = synchronized(lock) { pending.peekFirst() } ?: return C.RESULT_END_OF_INPUT
+            val count = piece.read(buffer, offset, length)
+            if (count >= 0) return count
+            synchronized(lock) {
+                if (pending.peekFirst() === piece) pending.removeFirst()
+            }
+            piece.dispose()
+        }
+    }
+
+    private fun checkOpen() {
+        if (closed || Thread.currentThread().isInterrupted) throw RangeCanceledException("Range canceled")
+    }
+
+    private fun acceptMetadata(content: ParallelContentRange) {
+        total.compareAndSet(-1L, content.total)
+        if (total.get() != content.total) throw IOException("CDN resource length changed")
+        end = minOf(end, content.total - 1L)
     }
 
     override fun close() {
-        if (closed) return
-        closed = true
-        cancellation.cancel()
-        futures.forEach { future -> future.cancel(true) }
+        val pieces = synchronized(lock) {
+            if (closed) return
+            closed = true
+            pending.toList().also { pending.clear() }
+        }
+        pieces.forEach { it.dispose() }
+        scheduler.unregister(this)
     }
 
-    private fun downloadPiece(index: Int, piece: ParallelByteRange): ParallelRangePieceResult {
-        val candidatesInOrder = candidateOrder()
-        val output = ByteArray(piece.length.toInt())
-        var received = 0
-        var attempt = 0
-        var lastError: IOException? = null
-        val pieceStartedAtNs = System.nanoTime()
+    private inner class Piece(val range: ParallelByteRange, private val isHead: Boolean) {
+        private val monitor = Object()
+        private var bytes: ByteArray? = ByteArray(range.length.toInt())
+        private var size = range.length.toInt()
+        private var filled = 0
+        private var consumed = 0
+        private var headers = false
+        private var disposed = false
+        private var running = 0
+        private var attempts = 0
+        private var rescued = false
+        private val tried = HashSet<Uri>()
+        private var error: IOException? = null
+        private val calls = ConcurrentHashMap<Call, Uri>()
+        private val jobs = CopyOnWriteArrayList<Future<*>>()
+        private val createdAt = rangeNowMs()
+        private var lastProgress = createdAt
 
-        while (received < output.size && attempt < ParallelRangeConfig.MAX_ATTEMPTS_PER_PIECE) {
-            cancellation.throwIfCanceled()
-            val candidate = candidatesInOrder[attempt % candidatesInOrder.size]
-            val requestStart = piece.start + received.toLong()
-            val expectedLength = output.size - received
-            var attemptReceived = 0L
-            val call =
-                client.newCall(
-                    buildRequest(
-                        uri = candidate,
-                        start = requestStart,
-                        end = piece.end,
-                    ),
-                )
-            cancellation.register(call)
+        fun launch(isRescue: Boolean, primary: Uri? = null) {
+            val uri = synchronized(monitor) {
+                if (disposed || closed || (headers && filled >= size) || attempts >= 3) return
+                val ranked = ordered(balance = !isHead)
+                val chosen = primary?.takeIf { it in ranked }
+                    ?: ranked.firstOrNull { it !in tried }
+                    ?: ranked.firstOrNull { it !in calls.values }
+                    ?: return
+                if (isRescue && (rescued || chosen in calls.values)) return
+                if (isRescue) rescued = true
+                attempts++
+                running++
+                tried.add(chosen)
+                chosen
+            }
             try {
-                call.timeout().timeout(ParallelRangeConfig.CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                call.execute().use { response ->
-                    val contentRange = parseParallelContentRange(response.header("Content-Range"))
-                    if (response.code != 206 || contentRange == null) {
-                        throw IOException("range response invalid http=${response.code} url=${candidate.host}")
+                if (isRescue) calls.values.filter { it != uri }.forEach(speedTracker::recordFailure)
+                val job = scheduler.submit(
+                    priority = if (isRescue || isHead) 0 else if (state.kind == DebugStreamKind.AUDIO) 1 else 10,
+                    isRescue = isRescue,
+                ) { download(uri) }
+                jobs.add(job)
+                if (synchronized(monitor) { disposed }) scheduler.cancel(job)
+                if (isRescue && scheduler.options.debug) AppLog.d("RangeAccel", "rescue tail host=" + uri.host)
+            } catch (e: RuntimeException) {
+                synchronized(monitor) {
+                    running--
+                    error = IOException("Range scheduling failed", e)
+                    monitor.notifyAll()
+                }
+            }
+        }
+
+        private fun rescueIfNeeded() {
+            if (!scheduler.options.rescueEnabled || candidates.size < 2) return
+            val due = synchronized(monitor) {
+                val elapsed = rangeNowMs() - createdAt
+                val remainingMs = if (filled > 0) (size - filled) * elapsed / filled else Long.MAX_VALUE
+                !rescued && !disposed && elapsed >= ParallelRangeConfig.STALL_MS &&
+                    (rangeNowMs() - lastProgress >= ParallelRangeConfig.STALL_MS ||
+                        (scheduler.bufferedMs < 3_000L && remainingMs > 700L))
+            }
+            if (due) launch(isRescue = true)
+        }
+
+        private fun waitForData(headersOnly: Boolean) {
+            val since = rangeNowMs()
+            while (true) {
+                checkOpen()
+                rescueIfNeeded()
+                synchronized(monitor) {
+                    if (disposed) throw RangeCanceledException("Range closed")
+                    if (if (headersOnly) headers else filled > consumed || (headers && consumed >= size)) return
+                    if (running == 0) throw error ?: IOException("No usable range route")
+                    if (rangeNowMs() - since >= ParallelRangeConfig.CRITICAL_WAIT_MS) throw IOException("Range deadline exceeded")
+                    try {
+                        monitor.wait(100L)
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        throw RangeCanceledException("Range wait canceled")
                     }
-                    if (contentRange.start != requestStart || contentRange.end != piece.end || contentRange.length != expectedLength.toLong()) {
-                        throw IOException(
-                            "range response mismatch expected=$requestStart-${piece.end} " +
-                                "actual=${contentRange.start}-${contentRange.end}",
-                        )
+                }
+            }
+        }
+
+        fun awaitHeaders() { waitForData(headersOnly = true) }
+        fun read(target: ByteArray, offset: Int, length: Int): Int {
+            waitForData(headersOnly = false)
+            return synchronized(monitor) {
+                if (consumed >= size) return@synchronized C.RESULT_END_OF_INPUT
+                val count = minOf(length, filled - consumed)
+                val source = bytes ?: throw RangeCanceledException("Range released")
+                source.copyInto(target, offset, consumed, consumed + count)
+                consumed += count
+                count
+            }
+        }
+
+        /** Returns only NEW useful bytes, never duplicate hedge traffic. */
+        private fun publish(position: Int, source: ByteArray, count: Int): Int = synchronized(monitor) {
+            if (disposed || closed) throw RangeCanceledException("Range canceled")
+            if (position > filled) throw IOException("Non-contiguous range response")
+            val skip = (filled - position).coerceAtMost(count)
+            val added = minOf(count - skip, size - filled)
+            if (added > 0) {
+                source.copyInto(checkNotNull(bytes), filled, skip, skip + added)
+                filled += added
+                lastProgress = rangeNowMs()
+                if (filled == size && isHead) headComplete = true
+                monitor.notifyAll()
+            }
+            added
+        }
+
+        private fun download(uri: Uri) {
+            var call: Call? = null
+            var useful = 0L
+            val startedAt = rangeNowMs()
+            speedTracker.started(uri)
+            try {
+                checkOpen()
+                val offset = synchronized(monitor) {
+                    if (disposed || (headers && filled >= size)) return
+                    filled
+                }
+                val requestStart = range.start + offset
+                val requestEnd = minOf(range.end, end)
+                val builder = Request.Builder().url(uri.toString())
+                requestHeaders.forEach { (name, value) ->
+                    if (!name.equals("Range", true) && !name.equals("Accept-Encoding", true)) builder.header(name, value)
+                }
+                val request = builder.header("Range", "bytes=" + requestStart + "-" + requestEnd)
+                    .header("Accept-Encoding", "identity").get().build()
+                val activeCall = client.newCall(request)
+                call = activeCall
+                calls[activeCall] = uri
+                if (synchronized(monitor) { disposed || (headers && filled >= size) } || closed) {
+                    activeCall.cancel()
+                    return
+                }
+                activeCall.timeout().timeout(ParallelRangeConfig.CALL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                activeCall.execute().use { response ->
+                    val content = parseParallelContentRange(response.header("Content-Range"))
+                    if (response.code != 206 || content == null) {
+                        if (response.code == 200 || response.code == 206 || response.code == 416) speedTracker.markUnsupported(uri)
+                        throw IOException("Invalid range status=" + response.code)
                     }
-                    val contentLength =
-                        response.header("Content-Length")?.toLongOrNull()
-                            ?: response.body?.contentLength()
-                            ?: -1L
-                    if (contentLength >= 0L && contentLength != expectedLength.toLong()) {
-                        throw IOException("range body length mismatch expected=$expectedLength actual=$contentLength")
+                    if (content.start != requestStart || content.end != minOf(requestEnd, content.total - 1L)) {
+                        speedTracker.markUnsupported(uri)
+                        throw IOException("Invalid Content-Range")
                     }
-                    val body = response.body ?: throw IOException("range response has no body")
+                    val body = response.body ?: throw IOException("Empty range body")
+                    if (body.contentLength() >= 0L && body.contentLength() != content.length) throw IOException("Invalid range length")
+                    acceptMetadata(content)
+                    synchronized(monitor) {
+                        size = (minOf(range.end, end) - range.start + 1L).toInt()
+                        headers = true
+                        monitor.notifyAll()
+                    }
+                    onHost?.invoke(uri.host.orEmpty())
                     body.byteStream().use { input ->
-                        while (received < output.size) {
-                            cancellation.throwIfCanceled()
-                            val count = input.read(output, received, output.size - received)
-                            if (count < 0) throw IOException("range body ended at $received/${output.size}")
-                            if (count == 0) {
-                                Thread.yield()
-                                continue
-                            }
-                            received += count
-                            attemptReceived += count.toLong()
+                        val scratch = ByteArray(16 * 1024)
+                        var position = offset
+                        val expected = (content.end - range.start + 1L).toInt()
+                        while (position < expected) {
+                            checkOpen()
+                            val count = input.read(scratch, 0, minOf(scratch.size, expected - position))
+                            if (count < 0) throw IOException("Truncated range body")
+                            if (count == 0) continue
                             onNetworkBytes?.invoke(count.toLong())
+                            val added = publish(position, scratch, count)
+                            useful += added
+                            scheduler.usefulBytes(added)
+                            position += count
+                            if (synchronized(monitor) { filled >= size }) break
                         }
                     }
-                    val currentTotal = expectedTotal.get()
-                    if (currentTotal > 0L && currentTotal != contentRange.total) {
-                        throw IOException("CDN total length mismatch expected=$currentTotal actual=${contentRange.total}")
-                    }
-                    expectedTotal.compareAndSet(-1L, contentRange.total)
-                    if (expectedTotal.get() != contentRange.total) {
-                        throw IOException("CDN total length changed during range download")
-                    }
-                    val elapsedMs = ((System.nanoTime() - pieceStartedAtNs) / 1_000_000L).coerceAtLeast(1L)
-                    speedTracker.recordSuccess(candidate, piece.length, elapsedMs)
-                    state.prefer(stateIndexOf(candidate))
-                    onHost?.invoke(candidate.host.orEmpty())
-                    return ParallelRangePieceResult(bytes = output, totalLength = contentRange.total, url = candidate)
                 }
             } catch (e: IOException) {
-                if (closed) throw e
-                lastError = e
-                speedTracker.recordFailure(candidate, receivedBytes = attemptReceived)
-                attempt++
+                synchronized(monitor) { error = e }
+                if (!closed && synchronized(monitor) { !disposed && filled < size }) {
+                    speedTracker.recordFailure(uri)
+                }
+            } catch (e: RuntimeException) {
+                synchronized(monitor) { error = IOException("Range request failed", e) }
             } finally {
-                cancellation.unregister(call)
+                val completed = synchronized(monitor) { headers && filled >= size }
+                if (completed && useful > 0L) {
+                    speedTracker.recordSuccess(uri, useful, rangeNowMs() - startedAt)
+                    val best = ordered().firstOrNull()
+                    val index = candidates.indexOf(best)
+                    if (index >= 0) state.prefer(state.candidates.indexOf(candidates[index]).coerceAtLeast(0))
+                    calls.keys.filter { it !== call }.forEach { it.cancel() }
+                }
+                call?.let { calls.remove(it) }
+                speedTracker.finished(uri)
+                // Schedule a tail retry before advertising that all attempts have ended.
+                val retry = synchronized(monitor) {
+                    !closed && !disposed && !completed && running == 1 && attempts < 3
+                }
+                if (retry) launch(isRescue = false)
+                synchronized(monitor) {
+                    running--
+                    monitor.notifyAll()
+                }
             }
         }
-        throw lastError ?: IOException("parallel range piece failed index=$index")
-    }
 
-    private fun candidateOrder(): List<Uri> {
-        val startIndex = state.claimCandidateStartIndex()
-        return speedTracker.ordered(candidateUris, startIndex).ifEmpty { candidateUris }
-    }
-
-    private fun stateIndexOf(uri: Uri): Int {
-        val index = state.candidates.indexOfFirst { it == uri }
-        return index.takeIf { it >= 0 } ?: 0
-    }
-
-    private fun buildRequest(uri: Uri, start: Long, end: Long): Request {
-        val builder = Request.Builder().url(uri.toString())
-        requestHeaders.forEach { (name, value) ->
-            if (
-                name.isNotBlank() &&
-                !name.equals("Range", ignoreCase = true) &&
-                !name.equals("Accept-Encoding", ignoreCase = true)
-            ) {
-                builder.header(name, value)
+        fun dispose() {
+            synchronized(monitor) {
+                if (disposed) return
+                disposed = true
+                bytes = null
+                monitor.notifyAll()
             }
+            calls.keys.forEach { it.cancel() }
+            jobs.forEach(scheduler::cancel)
+            scheduler.release(range.length.toInt())
         }
-        return builder
-            .header("Range", "bytes=$start-$end")
-            .header("Accept-Encoding", "identity")
-            .get()
-            .build()
     }
 }
 
@@ -412,17 +520,10 @@ internal class ParallelRangeDataSourceFactory(
     private val scheduler: ParallelRangeScheduler,
     private val speedTracker: CdnSpeedTracker,
     private val onTransferHost: ((String) -> Unit)? = null,
+    private val onNetworkBytes: ((Long) -> Unit)? = null,
 ) : DataSource.Factory {
     override fun createDataSource(): DataSource =
-        ParallelRangeDataSource(
-            fallbackFactory = fallbackFactory,
-            client = client,
-            candidates = candidates,
-            state = state,
-            scheduler = scheduler,
-            speedTracker = speedTracker,
-            onTransferHost = onTransferHost,
-        )
+        ParallelRangeDataSource(fallbackFactory, client, candidates, state, scheduler, speedTracker, onTransferHost, onNetworkBytes)
 }
 
 private class ParallelRangeDataSource(
@@ -433,165 +534,121 @@ private class ParallelRangeDataSource(
     private val scheduler: ParallelRangeScheduler,
     private val speedTracker: CdnSpeedTracker,
     private val onTransferHost: ((String) -> Unit)?,
+    private val onNetworkBytes: ((Long) -> Unit)?,
 ) : DataSource {
-    private val transferListeners = ArrayList<TransferListener>(2)
+    private val listeners = CopyOnWriteArrayList<TransferListener>()
+    private val listenerLock = Any()
     private var delegate: DataSource? = null
     private var session: ParallelRangeSession? = null
-    private var sourceSpec: DataSpec? = null
-    private var currentPiece: ParallelRangePieceResult? = null
-    private var currentPieceOffset: Int = 0
-    private var nextPieceIndex: Int = 0
-    private var deliveredBytes: Long = 0L
+    private var spec: DataSpec? = null
+    private var delivered = 0L
+    private var resolvedLength = C.LENGTH_UNSET.toLong()
     private var transferStarted = false
-    private var fallbackActivated = false
 
     override fun addTransferListener(transferListener: TransferListener) {
-        transferListeners += transferListener
+        listeners.addIfAbsent(transferListener)
         delegate?.addTransferListener(transferListener)
     }
-
     override fun open(dataSpec: DataSpec): Long {
         close()
-        sourceSpec = dataSpec
-        if (!isEligible(dataSpec)) return openFallback(dataSpec)
-
-        val rangeCandidates = candidates.ifEmpty { listOf(dataSpec.uri) }
-        val rangeSession =
-            runCatching {
-                ParallelRangeSession(
-                    client = client,
-                    candidates = rangeCandidates,
-                    state = state,
-                    scheduler = scheduler,
-                    speedTracker = speedTracker,
-                    start = dataSpec.position,
-                    length = dataSpec.length,
-                    requestHeaders = dataSpec.httpRequestHeaders,
-                    onHost = onTransferHost,
-                )
-            }.getOrElse {
-                return openFallback(dataSpec)
-            }
-        session = rangeSession
-        transferListeners.forEach { it.onTransferInitializing(this, dataSpec, true) }
-        return try {
-            rangeSession.awaitPiece(0)
-            transferListeners.forEach { it.onTransferStart(this, dataSpec, true) }
+        spec = dataSpec
+        // Only registered media URLs: never replace HLS child/playlist URLs with a parent CDN URL.
+        val media = candidates.any { it == dataSpec.uri }
+        val path = dataSpec.uri.path.orEmpty().lowercase(Locale.US)
+        if (!scheduler.options.enabled || !media ||
+            path.endsWith(".m3u8") || path.endsWith(".mpd") ||
+            !(dataSpec.uri.scheme.equals("https", true) || dataSpec.uri.scheme.equals("http", true)) ||
+            dataSpec.httpMethod != DataSpec.HTTP_METHOD_GET || dataSpec.httpBody != null ||
+            dataSpec.length == 0L || candidates.none(speedTracker::supportsRange)
+        ) return openFallback(dataSpec)
+        synchronized(listenerLock) {
+            listeners.forEach { it.onTransferInitializing(this, dataSpec, true) }
+            listeners.forEach { it.onTransferStart(this, dataSpec, true) }
             transferStarted = true
-            dataSpec.length
-        } catch (throwable: Throwable) {
-            rangeSession.close()
+        }
+        val range = ParallelRangeSession(
+            client, candidates, state, scheduler, speedTracker, dataSpec.position, dataSpec.length,
+            requestHeaders = dataSpec.httpRequestHeaders, onHost = onTransferHost,
+            onNetworkBytes = { count ->
+                synchronized(listenerLock) {
+                    if (transferStarted && spec === dataSpec) {
+                        onNetworkBytes?.invoke(count)
+                        listeners.forEach { it.onBytesTransferred(this, dataSpec, true, count.toInt()) }
+                    }
+                }
+            },
+        )
+        session = range
+        return try {
+            range.open().also { resolvedLength = it }
+        } catch (e: IOException) {
+            range.close()
             session = null
-            notifyParallelTransferEnd(dataSpec)
+            endTransfer()
+            if (Thread.currentThread().isInterrupted || e is RangeCanceledException) throw e
+            AppLog.w("RangeAccel", "range unavailable; using original stream: " + e.message)
             openFallback(dataSpec)
         }
     }
-
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-        val fallback = delegate
-        if (fallback != null) return fallback.read(buffer, offset, length)
+        delegate?.let { return it.read(buffer, offset, length) }
         if (length == 0) return 0
-        val rangeSession = session ?: throw IllegalStateException("read() before open()")
-        while (true) {
-            val piece = currentPiece
-            if (piece != null && currentPieceOffset < piece.bytes.size) {
-                val count = minOf(length, piece.bytes.size - currentPieceOffset)
-                piece.bytes.copyInto(buffer, destinationOffset = offset, startIndex = currentPieceOffset, endIndex = currentPieceOffset + count)
-                currentPieceOffset += count
-                deliveredBytes += count.toLong()
-                val spec = sourceSpec ?: throw IllegalStateException("missing source spec")
-                transferListeners.forEach { it.onBytesTransferred(this, spec, true, count) }
-                if (currentPieceOffset >= piece.bytes.size) currentPiece = null
-                return count
-            }
-
-            if (nextPieceIndex >= rangeSession.pieces.size) return C.RESULT_END_OF_INPUT
-            try {
-                currentPiece = rangeSession.awaitPiece(nextPieceIndex++)
-                currentPieceOffset = 0
-            } catch (throwable: Throwable) {
-                return if (activateFallback(throwable)) {
-                    checkNotNull(delegate).read(buffer, offset, length)
-                } else {
-                    throw asIOException(throwable)
-                }
-            }
+        if (resolvedLength >= 0L && delivered >= resolvedLength) return C.RESULT_END_OF_INPUT
+        return try {
+            val count = checkNotNull(session).read(buffer, offset, length)
+            if (count > 0) delivered += count
+            count
+        } catch (e: IOException) {
+            session?.close()
+            session = null
+            endTransfer()
+            if (Thread.currentThread().isInterrupted || e is RangeCanceledException) throw e
+            val original = checkNotNull(spec)
+            val remaining = if (resolvedLength >= 0L) resolvedLength - delivered else C.LENGTH_UNSET.toLong()
+            if (remaining == 0L) return C.RESULT_END_OF_INPUT
+            val resume = original.buildUpon().setPosition(original.position + delivered).setLength(remaining).build()
+            AppLog.w("RangeAccel", "resume original stream at delivered=" + delivered + ": " + e.message)
+            openFallback(resume)
+            checkNotNull(delegate).read(buffer, offset, length)
         }
     }
-
-    override fun getUri(): Uri? = delegate?.uri ?: sourceSpec?.uri
-
+    private fun openFallback(dataSpec: DataSpec): Long {
+        val next = fallbackFactory.createDataSource()
+        listeners.forEach(next::addTransferListener)
+        delegate = next
+        return try { next.open(dataSpec) } catch (e: IOException) {
+            runCatching { next.close() }
+            delegate = null
+            throw e
+        }
+    }
+    override fun getUri(): Uri? = delegate?.uri ?: spec?.uri
+    override fun getResponseHeaders(): Map<String, List<String>> {
+        delegate?.let { return it.responseHeaders }
+        val range = session ?: return emptyMap()
+        val position = spec?.position ?: return emptyMap()
+        if (range.totalLength < 0L) return emptyMap()
+        return mapOf(
+            "Content-Length" to listOf(range.resolvedLength.toString()),
+            "Content-Range" to listOf("bytes " + position + "-" + (position + range.resolvedLength - 1L) + "/" + range.totalLength),
+            "Accept-Ranges" to listOf("bytes"),
+        )
+    }
+    private fun endTransfer() = synchronized(listenerLock) {
+        val original = spec
+        if (transferStarted && original != null) {
+            transferStarted = false
+            listeners.forEach { it.onTransferEnd(this, original, true) }
+        }
+    }
     override fun close() {
-        val spec = sourceSpec
         session?.close()
         session = null
-        if (spec != null) notifyParallelTransferEnd(spec)
+        endTransfer()
         runCatching { delegate?.close() }
         delegate = null
-        sourceSpec = null
-        currentPiece = null
-        currentPieceOffset = 0
-        nextPieceIndex = 0
-        deliveredBytes = 0L
-        fallbackActivated = false
+        spec = null
+        delivered = 0L
+        resolvedLength = C.LENGTH_UNSET.toLong()
     }
-
-    private fun activateFallback(throwable: Throwable): Boolean {
-        if (fallbackActivated) return false
-        val spec = sourceSpec ?: return false
-        fallbackActivated = true
-        session?.close()
-        session = null
-        notifyParallelTransferEnd(spec)
-        val remaining = (spec.length - deliveredBytes).coerceAtLeast(0L)
-        val fallbackSpec =
-            spec
-                .buildUpon()
-                .setPosition(spec.position + deliveredBytes)
-                .setLength(remaining)
-                .build()
-        return runCatching {
-            val next = fallbackFactory.createDataSource()
-            transferListeners.forEach(next::addTransferListener)
-            next.open(fallbackSpec)
-            delegate = next
-        }.onFailure {
-            AppLog.w("RangeAccel", "parallel download failed and single-connection fallback failed", throwable)
-        }.isSuccess
-    }
-
-    private fun openFallback(dataSpec: DataSpec): Long {
-        fallbackActivated = true
-        val next = fallbackFactory.createDataSource()
-        transferListeners.forEach(next::addTransferListener)
-        delegate = next
-        return try {
-            next.open(dataSpec)
-        } catch (throwable: Throwable) {
-            delegate = null
-            runCatching { next.close() }
-            throw throwable
-        }
-    }
-
-    private fun notifyParallelTransferEnd(dataSpec: DataSpec) {
-        if (!transferStarted) return
-        transferListeners.forEach { it.onTransferEnd(this, dataSpec, true) }
-        transferStarted = false
-    }
-
-    private fun isEligible(dataSpec: DataSpec): Boolean =
-        !fallbackActivated &&
-            (dataSpec.uri.scheme.equals("http", ignoreCase = true) || dataSpec.uri.scheme.equals("https", ignoreCase = true)) &&
-            dataSpec.httpMethod == DataSpec.HTTP_METHOD_GET &&
-            dataSpec.httpBody == null &&
-            dataSpec.length >= ParallelRangeConfig.MIN_ACCELERATED_RANGE_BYTES &&
-            dataSpec.length <= ParallelRangeConfig.MAX_ACCELERATED_RANGE_BYTES &&
-            dataSpec.length <= Int.MAX_VALUE.toLong() * ParallelRangeConfig.MAX_PIECES.toLong()
-
-    private fun asIOException(throwable: Throwable): IOException =
-        when (throwable) {
-            is IOException -> throwable
-            else -> IOException("parallel range read failed", throwable)
-        }
 }

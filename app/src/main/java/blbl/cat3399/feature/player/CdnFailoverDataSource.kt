@@ -17,8 +17,6 @@ internal class CdnFailoverState(
     @Volatile
     private var preferredIndex: Int = 0
 
-    private var roundRobinCursor: Int = 0
-
     @Synchronized
     fun getPreferredIndex(): Int {
         val last = candidates.lastIndex
@@ -31,18 +29,6 @@ internal class CdnFailoverState(
         preferredIndex = index.coerceIn(0, last.coerceAtLeast(0))
     }
 
-    /**
-     * Give concurrent range pieces different first candidates. A single shared preferred index
-     * makes every piece race the same CDN and turns multi-range playback back into one route.
-     */
-    @Synchronized
-    fun claimCandidateStartIndex(): Int {
-        val last = candidates.lastIndex
-        if (last < 0) return 0
-        val start = (preferredIndex + roundRobinCursor) % (last + 1)
-        roundRobinCursor = (roundRobinCursor + 1) % (last + 1)
-        return start
-    }
 }
 
 internal class CdnFailoverDataSourceFactory(

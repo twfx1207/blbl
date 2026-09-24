@@ -444,6 +444,35 @@ class SettingsRenderer(
                     ),
                 )
 
+            "下载加速" ->
+                listOf(
+                    SettingEntry(SettingId.RangeDownloadEnabled, "多线程下载加速",
+                        if (prefs.rangeDownloadEnabled) "开" else "关",
+                        "仅接管点播媒体下载；关闭后使用原下载链路。所有选项下次进入播放生效"),
+                    SettingEntry(SettingId.RangeDownloadAutomatic, "自动并发调度",
+                        if (prefs.rangeDownloadAutomatic) "自动" else "手动",
+                        "按有效吞吐和缓冲余量试探增加并发；没有收益时自动回退"),
+                    SettingEntry(SettingId.RangeDownloadConnections, "并发连接上限",
+                        prefs.rangeDownloadConnections.toString(),
+                        "音视频共享上限，包含 1 个补救槽位；TV 建议 4–6，不会始终占满"),
+                    SettingEntry(SettingId.RangeDownloadCdnMode, "CDN 优先策略",
+                        when (prefs.rangeDownloadCdnMode) {
+                            "mainland" -> "大陆节点优先"
+                            "overseas" -> "海外节点优先"
+                            else -> "自动测速优选"
+                        },
+                        "仅在播放接口返回的线路中优选；按已知域名识别区域，无对应节点时回退，不改写签名地址"),
+                    SettingEntry(SettingId.RangeDownloadRescue, "慢请求补救",
+                        if (prefs.rangeDownloadRescue) "开" else "关",
+                        "当前片过慢时从备用 CDN 请求缺失部分，完成后取消多余请求；可能增加少量流量"),
+                    SettingEntry(SettingId.RangeDownloadMemory, "下载缓存内存上限",
+                        prefs.rangeDownloadMemoryMiB.toString() + " MiB",
+                        "额外下载窗口的上限，不含播放器解码缓冲；低内存电视可选 2 MiB"),
+                    SettingEntry(SettingId.RangeDownloadDebug, "下载调试日志",
+                        if (prefs.rangeDownloadDebug) "开" else "关",
+                        "记录分片与补救信息，可在关于应用中导出；不记录完整签名 URL"),
+                )
+
             "其他设置" ->
                 listOf(
                     SettingEntry(SettingId.PlayerRenderView, "渲染视图", SettingsText.renderViewText(prefs.playerRenderViewType), null),

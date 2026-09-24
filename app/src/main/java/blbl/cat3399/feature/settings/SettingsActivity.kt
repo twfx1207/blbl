@@ -52,6 +52,7 @@ class SettingsActivity : BaseActivity() {
             "关于应用",
             "设备信息",
             "其他设置",
+            "下载加速",
         )
 
     override fun onCreate(savedInstanceState: Bundle?) {

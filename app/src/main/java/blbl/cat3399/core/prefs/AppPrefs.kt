@@ -338,6 +338,36 @@ class AppPrefs(context: Context) {
         get() = prefs.getBoolean(KEY_PLAYER_SEAMLESS_QUALITY_SWITCH_ENABLED, true)
         set(value) = prefs.edit().putBoolean(KEY_PLAYER_SEAMLESS_QUALITY_SWITCH_ENABLED, value).apply()
 
+    var rangeDownloadEnabled: Boolean
+        get() = prefs.getBoolean("range_download_enabled", true)
+        set(value) = prefs.edit().putBoolean("range_download_enabled", value).apply()
+
+    var rangeDownloadAutomatic: Boolean
+        get() = prefs.getBoolean("range_download_automatic", true)
+        set(value) = prefs.edit().putBoolean("range_download_automatic", value).apply()
+
+    var rangeDownloadConnections: Int
+        get() = prefs.getInt("range_download_connections", 6).coerceIn(2, 8)
+        set(value) = prefs.edit().putInt("range_download_connections", value.coerceIn(2, 8)).apply()
+
+    var rangeDownloadCdnMode: String
+        get() = prefs.getString("range_download_cdn_mode", "auto")
+            ?.takeIf { it in listOf("auto", "mainland", "overseas") } ?: "auto"
+        set(value) = prefs.edit().putString("range_download_cdn_mode",
+            value.takeIf { it in listOf("auto", "mainland", "overseas") } ?: "auto").apply()
+
+    var rangeDownloadRescue: Boolean
+        get() = prefs.getBoolean("range_download_rescue", true)
+        set(value) = prefs.edit().putBoolean("range_download_rescue", value).apply()
+
+    var rangeDownloadMemoryMiB: Int
+        get() = prefs.getInt("range_download_memory_mib", 4).coerceIn(2, 8)
+        set(value) = prefs.edit().putInt("range_download_memory_mib", value.coerceIn(2, 8)).apply()
+
+    var rangeDownloadDebug: Boolean
+        get() = prefs.getBoolean("range_download_debug", false)
+        set(value) = prefs.edit().putBoolean("range_download_debug", value).apply()
+
     var playerRenderViewType: String
         get() {
             val raw = prefs.getString(KEY_PLAYER_RENDER_VIEW, PLAYER_RENDER_VIEW_SURFACE_VIEW) ?: PLAYER_RENDER_VIEW_SURFACE_VIEW
