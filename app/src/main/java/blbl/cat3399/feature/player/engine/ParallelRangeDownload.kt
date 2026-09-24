@@ -321,7 +321,7 @@ internal class ParallelRangeSession(
                     if (response.code != 206 || contentRange == null) {
                         throw IOException("range response invalid http=${response.code} url=${candidate.host}")
                     }
-                    if (contentRange.start != requestStart || contentRange.end != piece.end || contentRange.length != expectedLength) {
+                    if (contentRange.start != requestStart || contentRange.end != piece.end || contentRange.length != expectedLength.toLong()) {
                         throw IOException(
                             "range response mismatch expected=$requestStart-${piece.end} " +
                                 "actual=${contentRange.start}-${contentRange.end}",

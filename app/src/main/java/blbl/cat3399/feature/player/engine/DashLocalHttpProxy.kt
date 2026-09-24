@@ -10,6 +10,7 @@ import okhttp3.Request
 import okhttp3.Response
 import java.io.BufferedOutputStream
 import java.io.Closeable
+import java.io.IOException
 import java.io.InputStream
 import java.net.InetAddress
 import java.net.ServerSocket
