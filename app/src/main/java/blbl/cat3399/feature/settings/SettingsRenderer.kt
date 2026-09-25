@@ -451,17 +451,17 @@ class SettingsRenderer(
                         "仅接管点播媒体下载；关闭后使用原下载链路。所有选项下次进入播放生效"),
                     SettingEntry(SettingId.RangeDownloadAutomatic, "自动并发调度",
                         if (prefs.rangeDownloadAutomatic) "自动" else "手动",
-                        "按有效吞吐和缓冲余量试探增加并发；没有收益时自动回退"),
+                        "按有效吞吐、视频码率和缓冲余量调节；低缓冲优先恢复，缓冲充足才回退"),
                     SettingEntry(SettingId.RangeDownloadConnections, "并发连接上限",
                         prefs.rangeDownloadConnections.toString(),
-                        "音视频共享上限，包含 1 个补救槽位；TV 建议 4–6，不会始终占满"),
-                    SettingEntry(SettingId.RangeDownloadCdnMode, "CDN 优先策略",
+                        "音视频共享上限，开启补救时预留 1 个槽位；默认 8，可关闭自动调度固定并发"),
+                    SettingEntry(SettingId.RangeDownloadCdnMode, "CDN 节点模式",
                         when (prefs.rangeDownloadCdnMode) {
-                            "mainland" -> "大陆节点优先"
-                            "overseas" -> "海外节点优先"
-                            else -> "自动测速优选"
+                            "mainland" -> "大陆模式"
+                            "overseas" -> "海外模式"
+                            else -> "自动（全节点测速）"
                         },
-                        "仅在播放接口返回的线路中优选；按已知域名识别区域，无对应节点时回退，不改写签名地址"),
+                        "补充内置可信 CDN 节点并实测；大陆模式含华为、阿里、08c 等，失败后保留原线路回退"),
                     SettingEntry(SettingId.RangeDownloadRescue, "慢请求补救",
                         if (prefs.rangeDownloadRescue) "开" else "关",
                         "当前片过慢时从备用 CDN 请求缺失部分，完成后取消多余请求；可能增加少量流量"),
@@ -470,7 +470,7 @@ class SettingsRenderer(
                         "额外下载窗口的上限，不含播放器解码缓冲；低内存电视可选 2 MiB"),
                     SettingEntry(SettingId.RangeDownloadDebug, "下载调试日志",
                         if (prefs.rangeDownloadDebug) "开" else "关",
-                        "记录分片与补救信息，可在关于应用中导出；不记录完整签名 URL"),
+                        "记录设置、实际节点、首字节、有效吞吐及缓冲，可导出日志；不记录完整签名 URL"),
                 )
 
             "其他设置" ->

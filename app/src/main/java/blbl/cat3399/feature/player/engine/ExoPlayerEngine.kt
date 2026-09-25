@@ -105,7 +105,13 @@ internal class ExoPlayerEngine(
     private val rangeHandler = Handler(exoPlayer.applicationLooper)
     private val rangeFeedback = object : Runnable {
         override fun run() {
-            rangeScheduler.updatePlayback((exoPlayer.bufferedPosition - exoPlayer.currentPosition).coerceAtLeast(0L))
+            val speed = exoPlayer.playbackParameters.speed.coerceAtLeast(0.1f)
+            val videoBitrate = exoPlayer.videoFormat?.bitrate?.coerceAtLeast(0)?.toLong() ?: 0L
+            val audioBitrate = exoPlayer.audioFormat?.bitrate?.coerceAtLeast(0)?.toLong() ?: 0L
+            rangeScheduler.updatePlayback(
+                ((exoPlayer.bufferedPosition - exoPlayer.currentPosition).coerceAtLeast(0L) / speed).toLong(),
+                ((videoBitrate + audioBitrate) * speed).toLong(),
+            )
             rangeHandler.postDelayed(this, 500L)
         }
     }
@@ -263,6 +269,26 @@ internal class ExoPlayerEngine(
         )
         exoPlayer.addAnalyticsListener(
             object : AnalyticsListener {
+                override fun onVideoDecoderInitialized(
+                    eventTime: AnalyticsListener.EventTime,
+                    decoderName: String,
+                    initializedTimestampMs: Long,
+                    initializationDurationMs: Long,
+                ) {
+                    if (rangeOptions.debug) AppLog.i("RangeAccel",
+                        "decoder name=$decoderName initMs=$initializationDurationMs")
+                }
+
+                override fun onDroppedVideoFrames(eventTime: AnalyticsListener.EventTime, droppedFrames: Int, elapsedMs: Long) {
+                    if (rangeOptions.debug) AppLog.i("RangeAccel",
+                        "video droppedFrames=$droppedFrames elapsedMs=$elapsedMs" +
+                            " bufferMs=${(exoPlayer.bufferedPosition - exoPlayer.currentPosition).coerceAtLeast(0L)}")
+                }
+
+                override fun onVideoCodecError(eventTime: AnalyticsListener.EventTime, videoCodecError: Exception) {
+                    if (rangeOptions.debug) AppLog.w("RangeAccel", "video codec error", videoCodecError)
+                }
+
                 override fun onRenderedFirstFrame(eventTime: AnalyticsListener.EventTime, output: Any, renderTimeMs: Long) {
                     qualitySwitchTargetQn?.let { targetQn ->
                         AppLog.i(
@@ -286,7 +312,7 @@ internal class ExoPlayerEngine(
                     AppLog.i(
                         "QualitySwitch",
                         "video format changed qn=$qn codecid=$codecid targetQn=${targetQn ?: -1} id=${format.id} " +
-                            "size=${format.width}x${format.height} bitrate=${format.bitrate} " +
+                            "size=${format.width}x${format.height} fps=${format.frameRate} codecs=${format.codecs} bitrate=${format.bitrate} " +
                             "reuseResult=${decoderReuseEvaluation?.result ?: -1} discardReasons=${decoderReuseEvaluation?.discardReasons ?: -1} " +
                             "elapsedMs=${if (qualitySwitchStartedAtMs > 0L) SystemClock.elapsedRealtime() - qualitySwitchStartedAtMs else -1L} " +
                             "requestPos=$qualitySwitchStartedPositionMs currentPos=${exoPlayer.currentPosition}",
@@ -465,11 +491,12 @@ internal class ExoPlayerEngine(
                 CdnFailoverDataSourceFactory(upstreamFactory = upstream, state = failoverState)
             }
         if (!rangeOptions.enabled) return fallbackFactory
+        val accelerated = BilibiliCdnRoutes.expand(uris.map { it.toString() }, rangeOptions.cdnMode).map { Uri.parse(it) }
         return ParallelRangeDataSourceFactory(
             fallbackFactory = fallbackFactory,
             client = client,
-            candidates = uris,
-            state = failoverState,
+            candidates = accelerated,
+            state = CdnFailoverState(kind = kind, candidates = accelerated),
             scheduler = rangeScheduler,
             speedTracker = cdnSpeedTracker,
             onTransferHost = { host -> onTransferHost?.invoke(kind, host) },

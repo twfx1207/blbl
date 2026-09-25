@@ -347,7 +347,7 @@ class AppPrefs(context: Context) {
         set(value) = prefs.edit().putBoolean("range_download_automatic", value).apply()
 
     var rangeDownloadConnections: Int
-        get() = prefs.getInt("range_download_connections", 6).coerceIn(2, 8)
+        get() = prefs.getInt("range_download_connections", 8).coerceIn(2, 8)
         set(value) = prefs.edit().putInt("range_download_connections", value.coerceIn(2, 8)).apply()
 
     var rangeDownloadCdnMode: String

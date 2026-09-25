@@ -1267,9 +1267,9 @@ class SettingsInteractionHandler(
             }
             SettingId.RangeDownloadCdnMode -> {
                 val values = listOf("auto", "mainland", "overseas")
-                val labels = listOf("自动测速优选", "大陆节点优先", "海外节点优先")
+                val labels = listOf("自动（全节点测速）", "大陆模式", "海外模式")
                 showChoiceDialog(
-                    title = "CDN 优先策略",
+                    title = "CDN 节点模式",
                     items = labels,
                     checkedIndex = values.indexOf(prefs.rangeDownloadCdnMode).coerceAtLeast(0),
                 ) { selected ->

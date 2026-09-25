@@ -45,6 +45,7 @@ internal class DashLocalHttpProxy(
     private data class UpstreamRegistration(
         val kind: DebugStreamKind,
         val candidates: List<Uri>,
+        val rangeCandidates: List<Uri>,
         val state: CdnFailoverState,
     )
 
@@ -76,11 +77,14 @@ internal class DashLocalHttpProxy(
         if (urls.isEmpty()) throw IllegalArgumentException("missing DASH upstream URL")
         val debugKind = if (k == "a") DebugStreamKind.AUDIO else DebugStreamKind.VIDEO
         val key = md5Hex("$k|${urls.joinToString(separator = "|")}")
+        val accelerated = BilibiliCdnRoutes.expand(urls.map { it.toString() }, rangeScheduler.options.cdnMode)
+            .map { Uri.parse(it) }
         upstreamByKey[key] =
             UpstreamRegistration(
                 kind = debugKind,
                 candidates = urls,
-                state = CdnFailoverState(kind = debugKind, candidates = urls),
+                rangeCandidates = accelerated,
+                state = CdnFailoverState(kind = debugKind, candidates = accelerated),
             )
         return "http://127.0.0.1:${port}/${k}/${key}.m4s"
     }
@@ -322,12 +326,13 @@ internal class DashLocalHttpProxy(
         val range = parseByteRange(rangeHeader) ?: return false
         val session = ParallelRangeSession(
             client = okHttpClient,
-            candidates = registration.candidates,
+            candidates = registration.rangeCandidates,
             state = registration.state,
             scheduler = rangeScheduler,
             speedTracker = cdnSpeedTracker,
             start = range.start,
             length = range.length,
+            originalUri = registration.candidates.firstOrNull(),
             onHost = { host -> onTransferHost?.invoke(registration.kind, host) },
             onNetworkBytes = { bytes -> onBytesTransferred?.invoke(registration.kind, bytes) },
         )

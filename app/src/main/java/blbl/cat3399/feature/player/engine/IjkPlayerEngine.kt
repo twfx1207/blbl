@@ -565,7 +565,15 @@ internal class IjkPlayerEngine(
             )
             p.setOnBufferingUpdateListener(
                 IMediaPlayer.OnBufferingUpdateListener { _, _ ->
-                    // We expose bufferedPosition via cached durations; no-op here.
+                    if (rangeOptions.enabled) {
+                        val dash = (source as? PlaybackSource.Vod)?.playable as? Playable.Dash
+                        val bitrate = (dash?.videoTrackInfo?.bandwidth ?: 0L) + (dash?.audioTrackInfo?.bandwidth ?: 0L)
+                        val speed = playbackSpeedInternal.coerceAtLeast(0.1f)
+                        rangeScheduler.updatePlayback(
+                            ((bufferedPosition - currentPosition).coerceAtLeast(0L) / speed).toLong(),
+                            (bitrate * speed).toLong(),
+                        )
+                    }
                 },
             )
 
